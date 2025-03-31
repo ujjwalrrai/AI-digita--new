@@ -1,0 +1,184 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+import joblib
+import pandas as pd
+from datetime import datetime
+
+import traceback
+import logging
+import sys
+import numpy as np
+
+# Configure logging to handle Unicode properly
+class UnicodeEscapeHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            # Escape Unicode characters if they can't be encoded
+            msg = msg.encode('ascii', 'replace').decode('ascii')
+            stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s: %(message)s",
+    handlers=[
+        UnicodeEscapeHandler(sys.stdout),
+        logging.FileHandler("api_debug.log", encoding='utf-8')
+    ],
+)
+
+# Load Pre-Trained ML Models and Preprocessor
+try:
+    models = {
+        'conversion_rate': joblib.load('marketing_campaign_model_conversion_rate.pkl'),
+        'roi': joblib.load('marketing_campaign_model_roi.pkl'),
+        'engagement': joblib.load('marketing_campaign_model_engagement.pkl')
+    }
+    preprocessor = joblib.load('marketing_campaign_model_preprocessor.pkl')
+    logging.info("Successfully loaded ML models and preprocessor")  # Removed emoji
+except Exception as e:
+    logging.error(f"Error loading ML models: {e}")  # Removed emoji
+    models = None
+    preprocessor = None
+
+# Request Model
+class CampaignInput(BaseModel):
+    campaign_type: str
+    customer_segment: str  # Note: This should match your React frontend
+    location: str
+    language: str
+    duration_days: int
+    month: int = None
+    year: int = None
+    conversion_weight: float = 1.0
+    roi_weight: float = 1.0
+    engagement_weight: float = 1.0
+
+# Response Model
+class CampaignRecommendation(BaseModel):
+    channel_used: str
+    target_audience: str
+    predicted_conversion_rate: float
+    predicted_roi: float
+    predicted_engagement: float
+    overall_score: float
+
+# Initialize FastAPI App
+app = FastAPI(title="Marketing Campaign Optimizer API")
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Marketing Campaign Optimizer API!"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "message": "API is running correctly"}  # Removed emoji
+
+def generate_recommendations(campaign: CampaignInput):
+    if models is None or preprocessor is None:
+        logging.error("ML models not loaded")  # Removed emoji
+        raise HTTPException(status_code=500, detail="ML models not available")
+
+    # Available channels and audiences
+    channels = ['Google Ads', 'YouTube', 'Instagram', 'Website', 'Facebook', 'Email']
+    audiences = ['Men 18-24', 'Men 25-34', 'Women 25-34', 'Women 35-44', 'All Ages']
+
+    # Prepare a DataFrame to test different combinations
+    test_combinations = []
+    for channel in channels:
+        for audience in audiences:
+            test_case = {
+                'Campaign_Type': campaign.campaign_type,
+                'Target_Audience': audience,
+                'Duration_Days': campaign.duration_days,
+                'Channel_Used': channel,
+                'Location': campaign.location,
+                'Language': campaign.language,
+                'Customer_Segment': campaign.customer_segment,  # Fixed field name
+                'Month': campaign.month if campaign.month else datetime.now().month,
+                'Year': campaign.year if campaign.year else datetime.now().year
+            }
+            test_combinations.append(test_case)
+
+    # Convert to DataFrame
+    test_df = pd.DataFrame(test_combinations)
+
+    try:
+        # Make predictions for each combination
+        results = []
+        for _, row in test_df.iterrows():
+            row_df = pd.DataFrame([row])
+            
+            pred_conversion = models['conversion_rate'].predict(row_df)[0]
+            pred_roi = models['roi'].predict(row_df)[0]
+            pred_engagement = models['engagement'].predict(row_df)[0]
+
+            overall_score = (
+                pred_conversion * campaign.conversion_weight +
+                pred_roi * campaign.roi_weight +
+                pred_engagement * campaign.engagement_weight
+            )
+
+            results.append({
+                'channel_used': row['Channel_Used'],
+                'target_audience': row['Target_Audience'],
+                'predicted_conversion_rate': float(pred_conversion),
+                'predicted_roi': float(pred_roi),
+                'predicted_engagement': float(pred_engagement),
+                'overall_score': float(overall_score)
+            })
+
+        # Sort by overall score (descending)
+        results_sorted = sorted(results, key=lambda x: x['overall_score'], reverse=True)
+        
+        logging.info(f"Generated {len(results_sorted)} recommendations")  # Removed emoji
+        return results_sorted
+
+    except Exception as e:
+        logging.error(f"Model Prediction Error: {e}")  # Removed emoji
+        raise HTTPException(status_code=500, detail="Error in model prediction")
+
+@app.post("/optimize", response_model=list[CampaignRecommendation])
+async def optimize_campaign(campaign: CampaignInput):
+    """
+    Generate marketing campaign recommendations based on user input.
+    Returns top recommendations with predicted metrics.
+    """
+    try:
+        logging.info(f"Received campaign input: {campaign.dict()}")  # Removed emoji
+        recommendations = generate_recommendations(campaign)
+        return recommendations[:10]  # Return top 10 recommendations
+    except ValidationError as ve:
+        logging.error(f"Validation Error: {ve}")  # Removed emoji
+        raise HTTPException(status_code=422, detail=str(ve))
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")  # Removed emoji
+        logging.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+# Global Exception Handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logging.error(f"Unhandled exception: {str(exc)}")  # Removed emoji
+    logging.error(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal Server Error", "details": str(exc)},
+    )
